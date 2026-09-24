@@ -1,0 +1,17 @@
+# Fixed native fixture caller; manual execution requires coordinator admission.
+name: Observe native fixture identity
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: fixture-oidc-denials
+  cancel-in-progress: false
+jobs:
+  observe:
+    if: github.ref == 'refs/heads/main'
+    uses: Valestrom/taptwo-oidc-fixture/.github/workflows/fixture-denial.yml@c6e72d584c21ea4cda6515db81d3a0f97760529c
+    permissions:
+      contents: read
+      id-token: write
