@@ -1,0 +1,317 @@
+# Resolved candidate; publication and live execution remain coordinator-gated.
+name: Fixed foreign and fork identity denial observer
+on:
+  workflow_call:
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  observe:
+    environment: stage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Observe fixed denial targets using only reviewed inline source
+        shell: bash --noprofile --norc -euo pipefail {0}
+        run: |
+          /usr/bin/python3 -I - <<'OBSERVER'
+          """Resolved candidate: fixed foreign/fork identity denials, no resource operations."""
+          import base64
+          import json
+          import os
+          import re
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timezone
+
+          # Exact identities and immutable subjects resolved from coordinator readback.
+          # Role inventory, accepted caller/harness sources and live evidence remain required.
+          BINDINGS = {
+              "parent": {
+                  "name": "Valestrom/taptwo-oidc-fixture",
+                  "id": 1386158341,
+                  "owner_id": 226228449,
+                  "subject": "repo:Valestrom@226228449/taptwo-oidc-fixture@1386158341:environment:stage"
+              },
+              "fork": {
+                  "name": "allybelle/taptwo-oidc-fixture",
+                  "id": 1386158475,
+                  "owner_id": 118649845,
+                  "subject": "repo:allybelle@118649845/taptwo-oidc-fixture@1386158475:environment:stage"
+              }
+          }
+          CALLER = ".github/workflows/fixture-caller.yml"
+          HARNESS = ".github/workflows/fixture-denial.yml"
+          AUDIENCE = "sts.amazonaws.com"
+          ENVIRONMENT = "stage"
+          STS = "https://sts.us-east-2.amazonaws.com/"
+          TARGETS = [
+              ("stage-publish", "arn:aws:iam::849176586911:role/mtg-workshop-stage-publish"),
+              ("stage-deploy", "arn:aws:iam::849176586911:role/mtg-workshop-stage-deploy"),
+              ("stage-plan", "arn:aws:iam::849176586911:role/mtg-workshop-stage-plan"),
+              ("stage-apply", "arn:aws:iam::849176586911:role/mtg-workshop-stage-apply"),
+              ("production-plan", "arn:aws:iam::814787354338:role/mtg-workshop-production-plan"),
+              ("production-apply", "arn:aws:iam::814787354338:role/mtg-workshop-production-apply"),
+          ]
+
+
+          class Refused(ValueError):
+              pass
+
+
+          def require(condition):
+              if not condition:
+                  raise Refused("Fixture observation refused; no acceptance evidence issued.")
+
+
+          def parsed(raw, maximum=300000):
+              require(isinstance(raw, bytes) and len(raw) <= maximum)
+              def pairs(items):
+                  value = {}
+                  for key, item in items:
+                      require(key not in value)
+                      value[key] = item
+                  return value
+              return json.loads(raw, object_pairs_hook=pairs,
+                                parse_constant=lambda _: require(False))
+
+
+          def stamp():
+              return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+          def check_bindings(bindings):
+              require(set(bindings) == {"parent", "fork"})
+              for kind, name in [("parent", "Valestrom/taptwo-oidc-fixture"),
+                                 ("fork", "allybelle/taptwo-oidc-fixture")]:
+                  entry = bindings[kind]
+                  require(set(entry) == {"name", "id", "owner_id", "subject"})
+                  require(entry["name"] == name)
+                  require(all(type(entry[k]) is int and entry[k] > 0 for k in ("id", "owner_id")))
+                  owner, repo = name.split("/")
+                  expected = f"repo:{owner}@{entry['owner_id']}/{repo}@{entry['id']}:environment:{ENVIRONMENT}"
+                  require(entry["subject"] == expected)
+              require(bindings["parent"]["id"] != bindings["fork"]["id"])
+
+
+          def context(env, bindings):
+              check_bindings(bindings)  # Refuse absent or changed identity pins before token/API access.
+              require(not any(k.startswith(("AWS_", "TF_")) for k in env))
+              refused = {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "BOTO_CONFIG",
+                         "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"}
+              require(not any(k.upper() in refused for k in env))
+              require(env.get("GITHUB_EVENT_NAME") == "workflow_dispatch")
+              require(env.get("GITHUB_REF") == "refs/heads/main")
+              name = env.get("GITHUB_REPOSITORY")
+              entries = [(kind, item) for kind, item in bindings.items() if item["name"] == name]
+              require(len(entries) == 1)
+              kind, entry = entries[0]
+              require(env.get("GITHUB_REPOSITORY_ID") == str(entry["id"]))
+              require(env.get("GITHUB_REPOSITORY_OWNER_ID") == str(entry["owner_id"]))
+              for key in ("GITHUB_SHA", "GITHUB_WORKFLOW_SHA"):
+                  require(re.fullmatch(r"[0-9a-f]{40}", env.get(key, "")))
+              for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"):
+                  require(re.fullmatch(r"[1-9][0-9]{0,19}", env.get(key, "")))
+              expected = name + "/" + CALLER + "@refs/heads/main"
+              require(env.get("GITHUB_WORKFLOW_REF") == expected)
+              return {"kind": kind, "repository": name, "repository_id": entry["id"],
+                      "owner_id": entry["owner_id"], "ref": env["GITHUB_REF"],
+                      "sha": env["GITHUB_SHA"], "workflow_sha": env["GITHUB_WORKFLOW_SHA"],
+                      "workflow_ref": expected, "run_id": env["GITHUB_RUN_ID"],
+                      "run_attempt": env["GITHUB_RUN_ATTEMPT"], "event": "workflow_dispatch",
+                      "environment": ENVIRONMENT, "subject": entry["subject"]}
+
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  raise Refused("Redirect refused.")
+
+
+          class Transport:
+              def __init__(self):
+                  self.deadline = time.monotonic() + 180
+                  self.count = 0
+                  self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+
+              def request(self, request, maximum):
+                  self.count += 1
+                  remaining = self.deadline - time.monotonic()
+                  require(self.count <= 40 and remaining > 0)
+                  try:
+                      response = self.opener.open(request, timeout=min(10, remaining))
+                  except urllib.error.HTTPError as error:
+                      response = error
+                  with response:
+                      raw = response.read(maximum + 1)
+                      require(len(raw) <= maximum)
+                      return response.code, raw
+
+              def github(self, path):
+                  # Only fixed paths assembled below from validated identifiers; no API input.
+                  require(re.fullmatch(r"/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_./-]+)?", path))
+                  require(".." not in path.replace("...", "") and "?" not in path)
+                  request = urllib.request.Request("https://api.github.com" + path, headers={
+                      "Accept": "application/vnd.github+json", "User-Agent": "taptwo-fixture-observer",
+                      "X-GitHub-Api-Version": "2026-03-10"})
+                  status, raw = self.request(request, 300000)
+                  require(status == 200)
+                  return parsed(raw)
+
+              def token(self, env):
+                  url = env.get("ACTIONS_ID_TOKEN_REQUEST_URL", "")
+                  target = urllib.parse.urlsplit(url)
+                  require(target.scheme == "https" and not target.username and not target.password)
+                  require(target.port in (None, 443) and not target.fragment)
+                  require(re.fullmatch(r"[a-z0-9.-]+\.actions\.githubusercontent\.com", target.hostname or ""))
+                  require(re.fullmatch(r"/[A-Za-z0-9_./%~-]{1,2048}", target.path))
+                  require(not any(part in (".", "..") for part in urllib.parse.unquote(target.path).split("/")))
+                  query = urllib.parse.parse_qsl(target.query, keep_blank_values=True, strict_parsing=True)
+                  require(len(query) <= 12 and len({k for k, _ in query}) == len(query))
+                  require(all(re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", k) and k.lower() != "audience"
+                              and re.fullmatch(r"[A-Za-z0-9_./+=%:-]{1,2048}", v) for k, v in query))
+                  bearer = env.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
+                  require(isinstance(bearer, str) and 0 < len(bearer) <= 20000 and "\n" not in bearer and "\r" not in bearer)
+                  query.append(("audience", AUDIENCE))
+                  url = urllib.parse.urlunsplit((target.scheme, target.netloc, target.path,
+                                                urllib.parse.urlencode(query), ""))
+                  status, raw = self.request(urllib.request.Request(url, headers={"Authorization": "Bearer " + bearer}), 30000)
+                  require(status == 200)
+                  value = parsed(raw, 30000)
+                  require(type(value) is dict and set(value) == {"value"})
+                  token = value["value"]
+                  require(isinstance(token, str) and len(token) <= 20000)
+                  return token
+
+              def denied(self, token, arn, ctx):
+                  require(arn in [target for _, target in TARGETS])
+                  body = urllib.parse.urlencode({"Action": "AssumeRoleWithWebIdentity", "Version": "2011-06-15",
+                        "RoleArn": arn, "RoleSessionName": "taptwo-fixture-" + ctx["run_id"] + "-" + ctx["run_attempt"],
+                        "DurationSeconds": "900", "WebIdentityToken": token}).encode()
+                  status, raw = self.request(urllib.request.Request(STS, data=body, headers={
+                      "Content-Type": "application/x-www-form-urlencoded"}), 65000)
+                  # A 200 response is discarded untouched: never inspect/use unexpected credentials.
+                  require(status == 403)
+                  require(b"<!" not in raw)
+                  root = ET.fromstring(raw)
+                  ns = "{https://sts.amazonaws.com/doc/2011-06-15/}"
+                  require(root.tag == ns + "ErrorResponse")
+                  require(len(root.findall(ns + "Error")) == 1)
+                  error = root.find(ns + "Error")
+                  require(len(error.findall(ns + "Code")) == 1 and error.findtext(ns + "Code") == "AccessDenied")
+                  require(error.findtext(ns + "Type") == "Sender")
+
+
+          def token_claims(token, ctx, bindings):
+              pieces = token.split(".")
+              require(len(pieces) == 3 and all(re.fullmatch(r"[A-Za-z0-9_-]+", p) for p in pieces))
+              claims = parsed(base64.urlsafe_b64decode(pieces[1] + "=" * (-len(pieces[1]) % 4)), 20000)
+              now = time.time()
+              require(claims.get("iss") == "https://token.actions.githubusercontent.com" and claims.get("aud") == AUDIENCE)
+              for key in ("iat", "exp", "nbf"):
+                  require(type(claims.get(key)) is int)
+              require(now - 600 <= claims["iat"] <= now + 30 and now - 600 <= claims["nbf"] <= now + 30
+                      and now < claims["exp"] <= now + 3600)
+              required = {"repository": ctx["repository"], "repository_id": str(ctx["repository_id"]),
+                          "repository_owner_id": str(ctx["owner_id"]), "ref": ctx["ref"], "sha": ctx["sha"],
+                          "workflow_ref": ctx["workflow_ref"], "workflow_sha": ctx["workflow_sha"],
+                          "run_id": ctx["run_id"], "run_attempt": ctx["run_attempt"], "event_name": ctx["event"],
+                          "repository_visibility": "public", "runner_environment": "github-hosted",
+                          "environment": ENVIRONMENT, "sub": bindings[ctx["kind"]]["subject"]}
+              require(all(claims.get(key) == expected for key, expected in required.items()))
+              require(ctx.get("environment") == ENVIRONMENT and ctx.get("subject") == claims["sub"])
+              harness = claims.get("job_workflow_sha", "")
+              require(re.fullmatch(r"[0-9a-f]{40}", harness))
+              harness_ref = bindings["parent"]["name"] + "/" + HARNESS + "@" + harness
+              require(claims.get("job_workflow_ref") == harness_ref)
+              # Parsing binds transport claims; it is not signature verification or approval.
+              return harness, harness_ref
+
+
+          def repo_view(value, expected, bindings, fork):
+              require(type(value) is dict and value.get("full_name") == expected["name"])
+              require(type(value.get("id")) is int and value["id"] == expected["id"])
+              require(value.get("owner", {}).get("id") == expected["owner_id"])
+              require(value.get("private") is False and value.get("visibility") == "public")
+              require(value.get("fork") is fork and value.get("default_branch") == "main")
+              lineage = {}
+              for field in ("parent", "source"):
+                  if fork:
+                      actual = value.get(field, {})
+                      require(actual.get("id") == bindings["parent"]["id"] and actual.get("full_name") == bindings["parent"]["name"])
+                      lineage[field] = {"id": actual["id"], "name": actual["full_name"]}
+                  else:
+                      require(field not in value)
+              return {"id": value["id"], "name": value["full_name"], "owner_id": expected["owner_id"],
+                      "fork": fork, "lineage": lineage}
+
+
+          def inventory(transport, ctx, bindings, harness):
+              parent = bindings["parent"]["name"]
+              rows = {}
+              for kind in ("parent", ctx["kind"]):
+                  if kind in rows:
+                      continue
+                  value = transport.github("/repos/" + bindings[kind]["name"])
+                  rows[kind] = repo_view(value, bindings[kind], bindings, kind == "fork")
+              base = "/repos/" + ctx["repository"]
+              ref = transport.github(base + "/git/ref/heads/main")
+              require(ref.get("object", {}).get("type") == "commit" and ref["object"].get("sha") == ctx["sha"])
+              run = transport.github(base + "/actions/runs/" + ctx["run_id"] + "/attempts/" + ctx["run_attempt"])
+              require(str(run.get("id")) == ctx["run_id"] and str(run.get("run_attempt")) == ctx["run_attempt"])
+              require(run.get("repository", {}).get("id") == ctx["repository_id"] and run.get("event") == "workflow_dispatch")
+              require(run.get("head_sha") == ctx["sha"] and run.get("head_branch") == "main" and run.get("path") == CALLER)
+              require(run.get("status") == "in_progress" and run.get("conclusion") is None and run.get("pull_requests") == [])
+              parent_ref = transport.github("/repos/" + parent + "/git/ref/heads/main")
+              parent_sha = parent_ref.get("object", {}).get("sha", "")
+              require(re.fullmatch(r"[0-9a-f]{40}", parent_sha))
+              comparison = transport.github("/repos/" + parent + "/compare/" + harness + "..." + parent_sha)
+              require(comparison.get("base_commit", {}).get("sha") == harness
+                      and comparison.get("merge_base_commit", {}).get("sha") == harness
+                      and comparison.get("status") in ("identical", "ahead"))
+              return {"repositories": rows, "parent_main_sha": parent_sha,
+                      "caller": ctx, "harness_sha": harness}
+
+
+          def observe(env, bindings, transport):
+              ctx = context(env, bindings)
+              started = stamp()
+              first = transport.token(env)
+              harness, harness_ref = token_claims(first, ctx, bindings)
+              before = inventory(transport, ctx, bindings, harness)
+              rows = []
+              for index, (role, arn) in enumerate(TARGETS):
+                  token = first if index == 0 else transport.token(env)
+                  require(token_claims(token, ctx, bindings) == (harness, harness_ref))
+                  transport.denied(token, arn, ctx)
+                  rows.append({"role": role, "arn": arn, "audience": AUDIENCE, "subject": ctx["subject"], "outcome": "sts_access_denied"})
+              require(inventory(transport, ctx, bindings, harness) == before)
+              return {"schema_version": "taptwo.foreign-fixture-observation/v1",
+                      "started_at": started, "finished_at": stamp(), "caller": ctx, "environment": ENVIRONMENT,
+                      "harness_sha": harness, "harness_workflow_ref": harness_ref,
+                      "repository_readback": before["repositories"], "observations": rows,
+                      "provenance": "coordinator_readback_required", "role_inventory": "before_and_after_required",
+                      "missing": ["fixture_fork_pull_request_issuance", "cloud_fork_pull_request"],
+                      "authorization_granted": False}
+
+
+          def main():
+              require(not sys.argv[1:])
+              context(os.environ, BINDINGS)
+              result = observe(dict(os.environ), BINDINGS, Transport())
+              print(json.dumps(result, sort_keys=True))
+
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception:
+                  # Never log bearer/JWT/STS response, temporary credentials or raw exceptions.
+                  raise SystemExit("Fixture observation failed; no acceptance evidence issued.") from None
+          OBSERVER
